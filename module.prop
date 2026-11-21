@@ -1,0 +1,6 @@
+id=vib_wave_boost
+name=真我neo8震动增强模块
+version=v1.0
+versionCode=1
+author=谦谦TWT
+description=【波形】RAM 波形 aw8697_haptic_170.bin 放大 1.85x 并软削顶 → 系统触摸/点击/长按更「实」；stepable 模板 aw8697_stepable_regulate_RTP_105_174Hz.bin 正弦放大 11x → QS 音量/亮度滑块、键盘等无级强度振动更「足」且保持细腻。【强度】通知 1800→2400、媒体 MEDIUM→HIGH（仅在值为空时写入，不覆盖手动设置）。卸载模块并重启即恢复波形。适用 realme Neo8 (RMX8899)，刷前请核对原厂固件 md5 = 8bb3e6427579954b3e0848e8a463ce84。
