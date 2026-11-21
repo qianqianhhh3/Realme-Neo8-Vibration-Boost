@@ -1,0 +1,2 @@
+allow ueventd adb_data_file file { open read getattr map }
+allow ueventd adb_data_file dir { open read getattr search }
