@@ -3,5 +3,5 @@ name=真我neo8震动增强模块
 version=v1.2
 versionCode=2
 author=谦谦TWT
-description=【RAM 波形】aw8697_haptic_170.bin 放大 1.85x 并软削顶 → 系统触摸/点击/长按更「实」。【无级波形】aw8697_stepable_regulate_RTP_105_174Hz.bin 重做：高占空比软方波（边沿 5 采样、平台约 74%）→ 键盘/QS 滑块等无级强度振动能量约 +30%；尾部加一拍反向刹车，消除收尾的「弹簧拖尾」；长度 423→1084 采样，匹配系统点击请求的 45ms，修掉「空心感」。【强度】通知 1800→2400、媒体 MEDIUM→HIGH（仅在值为空时写入，不覆盖手动设置）。卸载模块并重启即恢复波形。适用 realme Neo8 (RMX8899)。
+description=【RAM 波形】aw8697_haptic_170.bin 放大 1.85x 并软削顶，系统触摸/点击/长按更实。【无级波形】aw8697_stepable_regulate_RTP_105_174Hz.bin 正弦放大 11x（峰值 12→127，波形形状不变），QS 滑块与键盘等无级强度振动更有力度且保持细腻。【强度】通知 1800→2400、媒体 MEDIUM→HIGH，仅在值为空时写入，不覆盖手动设置。【兼容】post-fs-data 内置 bind mount 兜底，不支持 /odm overlay 的 KernelSU 分支同样可用。卸载模块并重启即恢复原厂波形。适用 realme Neo8 (RMX8899)。
 webui=1
