@@ -11,6 +11,11 @@
 # ============================================================
 
 MODDIR=${0%/*}
+
+# 模块被标记删除/禁用时不做任何挂载，保证卸载干净
+[ -f "$MODDIR/remove" ]  && exit 0
+[ -f "$MODDIR/disable" ] && exit 0
+
 SRC="$MODDIR/odm/firmware"
 DST=/odm/firmware
 LOG=/data/local/tmp/vib_boost_boot.log
