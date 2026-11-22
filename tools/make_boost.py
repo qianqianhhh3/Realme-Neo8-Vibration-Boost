@@ -1,33 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-真我 Neo8 振动增强 —— 本地生成器
+真我 Neo8 振动增强 —— 检查 + 生成（一个工具，两种用法）
 
-不下载任何二进制，直接读你自己手机上的原厂固件，按参数生成增强版，
-所以永远和你当前的系统版本匹配。
+    python3 make_boost.py --check          只看能不能用，不改任何东西
+    python3 make_boost.py --out /sdcard/vib_boost    生成
 
-用法（手机 Termux 里 su 之后，或电脑上把文件拷出来跑）：
-    python3 make_boost.py --out ./out
+为什么不直接比对 md5：md5 只能说明「和我这台一模一样」，说明不了「能用」。
+真正决定安全的是文件结构——所以这里解析校验和、描述符表、波形边界，
+结构合法就能安全放大，哪怕固件版本不同。
 
-在手机上直接跑（需要 root）：
-    su -c "python3 make_boost.py --out /sdcard/vib_boost"
-
-作者：谦谦TWT    本脚本由 AI 协助编写
+作者：谦谦TWT    本工具由 AI 协助编写
 """
-import argparse, os, shutil, math, sys
+import argparse, os, sys, math, shutil, subprocess
 
-RAM_SRC = "/odm/firmware/aw8697_haptic_170.bin"
-STEP_SRC = "/odm/firmware/aw8697_stepable_regulate_RTP_105_174Hz.bin"
+RAM_NAME  = "aw8697_haptic_170.bin"
+STEP_NAME = "aw8697_stepable_regulate_RTP_105_174Hz.bin"
+RAM_PATHS  = ["/odm/firmware/" + RAM_NAME,
+              "/vendor/firmware/" + RAM_NAME]
+STEP_PATHS = ["/odm/firmware/" + STEP_NAME,
+              "/vendor/firmware/" + STEP_NAME]
 
-RAM_GAIN  = 1.85   # RAM 波形增益（1.35 偏轻 / 1.7 甜点 / 2.0+ 会爆音）
-RAM_IDS   = [0, 1, 2, 3, 5]
-STEP_GAIN = 11.0   # stepable 正弦放大（原厂峰值 12，满幅 127 → 上限约 10.6x）
+RAM_GAIN_DEFAULT  = 1.85
+STEP_GAIN_DEFAULT = 11.0
+
+
+# ---------------------------------------------------------------- 工具函数
+def find_file(paths, override=None):
+    if override:
+        return override if os.path.isfile(override) else None
+    for p in paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def has_overlay(mount_path="/odm/firmware"):
+    """模块生效后 /odm/firmware 会被 KSU overlay 覆盖，读到的是改过的文件"""
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == mount_path and parts[2] == "overlay":
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def parse_ram(data):
-    """返回 [(start_file, end_file), ...]"""
+    """返回 (waveforms, err)。waveforms = [(start, end), ...] 文件内偏移"""
     if len(data) < 0x31:
-        raise ValueError("固件太小，格式不对")
+        return None, "文件太小（%d 字节），不是 RAM 固件格式" % len(data)
+    if data[0x04] == 0 and data[0x05] == 0:
+        return None, "头部全零，不是有效固件"
+
     start0 = (data[5] << 8) | data[6]
     starts, ends, pos = [start0], [], 0x07
     while pos + 1 <= 0x30:
@@ -35,20 +62,41 @@ def parse_ram(data):
         if pos + 1 > 0x30:
             break
         starts.append((data[pos] << 8) | data[pos + 1]); pos += 2
-    out = []
-    for s, e in zip(starts, ends):
+
+    if not starts or not ends:
+        return None, "描述符表为空"
+
+    wf, bad = [], []
+    for i, (s, e) in enumerate(zip(starts, ends)):
         sf, ef = s - 0x07FC, e - 0x07FC
-        if 0 <= sf < len(data) and sf <= ef < len(data):
-            out.append((sf, ef))
-    return out
+        if sf < 0 or ef < sf or ef >= len(data):
+            bad.append((i, sf, ef))
+            continue
+        wf.append((sf, ef))
+
+    if bad:
+        return wf, "有 %d 个波形的地址越界：%s（文件可能被截断或不是这个芯片的固件）" % (len(bad), bad[:3])
+    return wf, None
 
 
-def ram_checksum_ok(data):
+def checksum_ok(data):
     return ((data[0] << 8) | data[1]) == (sum(data[2:]) & 0xFFFF)
 
 
+def wave_stats(data, s, e):
+    v = [b if b < 128 else b - 256 for b in data[s:e + 1]]
+    if not v:
+        return 0, 0.0, 0
+    peak = max(abs(x) for x in v)
+    rms = math.sqrt(sum(x * x for x in v) / len(v))
+    active = sum(1 for x in v if x)
+    return peak, rms, active
+
+
 def build_ram(data, gain, ids):
-    wf = parse_ram(data)
+    wf, err = parse_ram(data)
+    if err:
+        raise RuntimeError(err)
     for idx in ids:
         if idx >= len(wf):
             continue
@@ -63,58 +111,171 @@ def build_ram(data, gain, ids):
     return data, c
 
 
-def build_step(data, gain):
-    vals = [b if b < 128 else b - 256 for b in data]
-    new = [127 if v * gain > 127 else (-128 if v * gain < -128 else int(round(v * gain)))
-           for v in vals]
-    return bytes((v + 256) % 256 for v in new), max(vals, key=abs), max(new, key=abs)
+# ---------------------------------------------------------------- 检查
+def do_check(ram_src, step_src):
+    ok_all = True
+    print("=" * 56)
+    print(" 真我 Neo8 振动增强 · 兼容性检查")
+    print("=" * 56)
+
+    if has_overlay() and not (ram_src and step_src):
+        print("\n⚠️  检测到 /odm/firmware 已被模块 overlay 覆盖。")
+        print("    现在读到的是「改过之后」的文件，不是原厂。")
+        print("    想看真实情况：先卸载模块并重启，或用 --ram-src 指定原厂备份。")
+        print("    （下面显示的是当前生效的文件，仅供确认模块是否工作）")
+
+    # --- RAM ---
+    print("\n[RAM 波形固件]")
+    ram_path = find_file(RAM_PATHS, ram_src)
+    if not ram_path:
+        print("  ✗ 找不到 %s" % RAM_NAME)
+        ok_all = False
+        ram_ok = False
+    else:
+        data = bytearray(open(ram_path, "rb").read())
+        print("  文件: %s" % ram_path)
+        print("  大小: %d 字节" % len(data))
+        wf, err = parse_ram(data)
+        if err:
+            print("  ✗ 结构解析失败: %s" % err)
+            ok_all = ram_ok = False
+        else:
+            print("  波形数: %d  尺寸: %s" % (len(wf), [e - s + 1 for s, e in wf]))
+            ck = checksum_ok(data)
+            print("  校验和: %s (记录 0x%04X / 实算 0x%04X)" %
+                  ("✗ 不一致" if not ck else "✓ 通过",
+                   (data[0] << 8) | data[1], sum(data[2:]) & 0xFFFF))
+            if not ck:
+                print("  ⚠️ 校验和不自洽 —— 文件可能被改过但没重算校验，驱动会拒绝加载")
+            print("  各波形:")
+            for i, (s, e) in enumerate(wf):
+                pk, rms, act = wave_stats(data, s, e)
+                flag = "  ← 会被增强" if i in (0, 1, 2, 3, 5) else ""
+                print("    [%2d] %4dB  峰值%4d  RMS%6.1f  发声%3d%s" % (i, e - s + 1, pk, rms, act, flag))
+            ram_ok = True
+        print("  结论: %s" % ("✓ 结构合法，可以安全增强" if ram_ok else "✗ 不要使用，请先反馈给作者"))
+        ok_all = ok_all and ram_ok
+
+    # --- stepable ---
+    print("\n[stepable 模板]（QS 滑块 / 键盘 / 无级强度）")
+    step_path = find_file(STEP_PATHS, step_src)
+    if not step_path:
+        print("  ✗ 找不到 %s" % STEP_NAME)
+        step_ok = False
+    else:
+        raw = open(step_path, "rb").read()
+        v = [b if b < 128 else b - 256 for b in raw]
+        peak = max(abs(x) for x in v) if v else 0
+        rms = math.sqrt(sum(x * x for x in v) / len(v)) if v else 0
+        lead = next((i for i, x in enumerate(v) if x), 0)
+        tail = len(v) - 1 - next((i for i in reversed(range(len(v))) if v[i]), len(v) - 1)
+        print("  文件: %s" % step_path)
+        print("  大小: %d 字节 (%.1fms @24kHz)" % (len(raw), len(raw) / 24.0))
+        print("  峰值: %d   RMS: %.1f   前静音 %d 采样 / 后静音 %d 采样" % (peak, rms, lead, tail))
+        step_ok = len(raw) > 100 and peak > 0
+        if step_ok:
+            print("  结论: ✓ 纯 int8 采样、无表结构，任何尺寸都能安全替换")
+            need = 127.0 / peak if peak else 0
+            print("        峰值 %d → 满幅 127 最多可放大 %.1fx（超过就只能削顶）" % (peak, need))
+        else:
+            print("  结论: ✗ 内容异常（全零或过短）")
+        ok_all = ok_all and step_ok
+
+    # --- 环境 ---
+    print("\n[运行环境]")
+    print("  芯片节点: %s" % ("✓ /dev/awinic_haptic" if os.path.exists("/dev/awinic_haptic") else "✗ 不存在"))
+    print("  root: %s" % ("✓" if os.geteuid() == 0 else "✗ 请用 su 运行"))
+
+    print("\n" + "=" * 56)
+    if ok_all:
+        print(" 结论：可以生成。执行：")
+        print("   python3 make_boost.py --out /sdcard/vib_boost")
+    else:
+        print(" 结论：**不要生成**。上面有 ✗ 的项，先把信息反馈给作者。")
+    print("=" * 56)
+    return 0 if ok_all else 1
+
+
+# ---------------------------------------------------------------- 生成
+def do_build(out_dir, ram_gain, step_gain, ram_src, step_src, ids):
+    fw = os.path.join(out_dir, "odm", "firmware")
+    bk = os.path.join(out_dir, "original_firmware")
+    os.makedirs(fw, exist_ok=True)
+    os.makedirs(bk, exist_ok=True)
+    made = []
+
+    ram_path = find_file(RAM_PATHS, ram_src)
+    if ram_path:
+        raw = bytearray(open(ram_path, "rb").read())
+        wf, err = parse_ram(raw)
+        if err:
+            print("✗ RAM 固件解析失败: %s —— 已跳过，不会生成" % err)
+        else:
+            shutil.copy(ram_path, os.path.join(bk, RAM_NAME))
+            new, c = build_ram(bytearray(raw), ram_gain, ids)
+            open(os.path.join(fw, RAM_NAME), "wb").write(new)
+            print("✓ RAM 波形  增益 %.2fx  波形 %s  新校验和 0x%04X"
+                  % (ram_gain, ids, c))
+            made.append("odm/firmware/" + RAM_NAME)
+            made.append("original_firmware/" + RAM_NAME)
+    else:
+        print("· 没找到 RAM 固件，跳过（只做 stepable）")
+
+    step_path = find_file(STEP_PATHS, step_src)
+    if step_path:
+        raw = open(step_path, "rb").read()
+        v = [b if b < 128 else b - 256 for b in raw]
+        pk = max(abs(x) for x in v) if v else 0
+        new = [127 if x * step_gain > 127 else (-128 if x * step_gain < -128 else int(round(x * step_gain)))
+               for x in v]
+        open(os.path.join(fw, STEP_NAME), "wb").write(bytes((x + 256) % 256 for x in new))
+        shutil.copy(step_path, os.path.join(bk, STEP_NAME))
+        print("✓ stepable  增益 %.1fx  峰值 %d → %d%s"
+              % (step_gain, pk, max(abs(x) for x in new),
+                 "（已触满幅，再多只能削顶）" if max(abs(x) for x in new) >= 127 else ""))
+        made.append("odm/firmware/" + STEP_NAME)
+        made.append("original_firmware/" + STEP_NAME)
+    else:
+        print("· 没找到 stepable，跳过")
+
+    print("\n输出目录: %s" % os.path.abspath(out_dir))
+    if subprocess.run(["id", "-u"], capture_output=True).stdout.strip() == b"0":
+        print("\n下一步（手机上执行）：")
+        print("  cp -r %s/odm /data/adb/modules/vib_wave_boost/" % os.path.abspath(out_dir))
+        print("  chcon -R u:object_r:vendor_file:s0 /data/adb/modules/vib_wave_boost/odm/firmware/")
+        print("  重启")
+    else:
+        print("\n把 odm/firmware/ 下的文件替换进手机模块目录，然后重启。")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="./out", help="输出目录")
-    ap.add_argument("--ram-gain", type=float, default=RAM_GAIN)
-    ap.add_argument("--step-gain", type=float, default=STEP_GAIN)
-    ap.add_argument("--ram-src", default=RAM_SRC)
-    ap.add_argument("--step-src", default=STEP_SRC)
+    ap = argparse.ArgumentParser(
+        description="真我 Neo8 振动增强 —— 检查与生成",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n"
+               "  python3 make_boost.py --check\n"
+               "  python3 make_boost.py --out /sdcard/vib_boost\n"
+               "  python3 make_boost.py --out ./out --ram-gain 1.7 --step-gain 8\n")
+    ap.add_argument("--check", action="store_true", help="只检查，不生成")
+    ap.add_argument("--out", help="生成到该目录")
+    ap.add_argument("--ram-gain", type=float, default=RAM_GAIN_DEFAULT,
+                    help="RAM 波形增益，默认 1.85（1.35 偏轻 / 1.7 甜点 / 2.0+ 爆音）")
+    ap.add_argument("--step-gain", type=float, default=STEP_GAIN_DEFAULT,
+                    help="stepable 增益，默认 11（原厂峰值 12，理论上限约 10.6x）")
+    ap.add_argument("--ids", type=int, nargs="+", default=[0, 1, 2, 3, 5],
+                    help="要增强的 RAM 波形索引，默认 0 1 2 3 5")
+    ap.add_argument("--ram-src", help="指定 RAM 固件路径（默认从 /odm/firmware 找）")
+    ap.add_argument("--step-src", help="指定 stepable 路径")
     a = ap.parse_args()
 
-    os.makedirs(a.out, exist_ok=True)
-    fw = os.path.join(a.out, "odm", "firmware")
-    bk = os.path.join(a.out, "original_firmware")
-    os.makedirs(fw, exist_ok=True)
-    os.makedirs(bk, exist_ok=True)
-
-    # --- RAM 固件 ---
-    if os.path.exists(a.ram_src):
-        raw = bytearray(open(a.ram_src, "rb").read())
-        print("[RAM] %s  %d 字节" % (a.ram_src, len(raw)))
-        print("[RAM] 原厂校验和 %s" % ("OK" if ram_checksum_ok(raw) else "不正常！"))
-        wf = parse_ram(raw)
-        print("[RAM] 解析出 %d 个波形: %s" % (len(wf), [e - s + 1 for s, e in wf]))
-        shutil.copy(a.ram_src, os.path.join(bk, "aw8697_haptic_170.bin"))
-        new, c = build_ram(bytearray(raw), a.ram_gain, RAM_IDS)
-        open(os.path.join(fw, "aw8697_haptic_170.bin"), "wb").write(new)
-        print("[RAM] 已生成，增益 %.2fx，新校验和 0x%04X" % (a.ram_gain, c))
-    else:
-        print("[RAM] 找不到 %s，跳过（可以只做 stepable）" % a.ram_src)
-
-    # --- stepable ---
-    if os.path.exists(a.step_src):
-        raw = open(a.step_src, "rb").read()
-        print("[STEP] %s  %d 字节" % (a.step_src, len(raw)))
-        shutil.copy(a.step_src, os.path.join(bk, os.path.basename(a.step_src)))
-        out, pk_old, pk_new = build_step(raw, a.step_gain)
-        open(os.path.join(fw, os.path.basename(a.step_src)), "wb").write(out)
-        print("[STEP] 已生成，增益 %.1fx，峰值 %d → %d" % (a.step_gain, pk_old, pk_new))
-    else:
-        print("[STEP] 找不到 %s，跳过" % a.step_src)
-
-    print("\n完成。把 %s 里的内容覆盖到模块目录：" % a.out)
-    print("  odm/firmware/       → /data/adb/modules/vib_wave_boost/odm/firmware/")
-    print("  original_firmware/  → 留着回滚用")
-    print("改完记得 chcon u:object_r:vendor_file:s0，然后重启。")
+    if a.check:
+        return do_check(a.ram_src, a.step_src)
+    if a.out:
+        do_build(a.out, a.ram_gain, a.step_gain, a.ram_src, a.step_src, a.ids)
+        return 0
+    ap.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
