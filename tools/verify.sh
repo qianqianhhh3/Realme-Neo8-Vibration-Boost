@@ -45,10 +45,13 @@ fi
 say "[1] 模块状态: 已启用"
 
 # ---- 2 overlay ----
-if mount 2>/dev/null | grep -q "KSU on /odm/firmware"; then
+OVL=$(mount 2>/dev/null | awk '$3=="/odm/firmware" && $5=="overlay"' | head -1)
+if [ -n "$OVL" ]; then
   ok "overlay 已挂载"
 else
   bad "overlay未挂载"
+  say "  -> /odm/firmware 当前挂载: $(mount 2>/dev/null | awk '$3=="/odm/firmware"{print $5; exit}')"
+  say "  -> 若为 erofs/只读，说明模块未被挂载。请确认：1) 已重启 2) 模块列表里已启用"
 fi
 
 # ---- 3 RAM 固件 ----
