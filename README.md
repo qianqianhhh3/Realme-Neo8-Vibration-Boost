@@ -10,7 +10,7 @@
 | 项目 | 说明 |
 |---|---|
 | 机型 | realme Neo8 / RMX8899 |
-| 系统 | realmeUI 7.0 / Android 17 |
+| 系统 | realmeUI 7.0 / color os 17 |
 | 芯片 | AW8697（AAC RichTap），驱动日志前缀 `[haptic_hv]` |
 | 环境 | KernelSU / ReSukiSU（依赖 overlay 与 sepolicy 注入） |
 
