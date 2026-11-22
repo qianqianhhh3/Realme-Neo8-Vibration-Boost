@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg:#121212; --card:#1e1e1e; --fg:#e8e8e8; --dim:#9a9a9a;
-    --accent:#4a9eff; --border:#2e2e2e;
+    --accent:#4a9eff; --ok:#4caf50; --warn:#ff9800; --err:#f44336; --border:#2e2e2e;
   }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f5f5f7; --card:#fff; --fg:#1a1a1a; --dim:#6b6b6b; --border:#e0e0e0; }
@@ -28,9 +28,17 @@
   button:disabled { opacity:.4; }
   #output {
     background:var(--card); border:1px solid var(--border); border-radius:10px;
-    padding:12px; font-family:ui-monospace,monospace; font-size:11.5px;
-    line-height:1.55; white-space:pre-wrap; word-break:break-all;
-    min-height:200px; color:var(--dim);
+    padding:14px; font-family:ui-monospace,monospace; font-size:12px;
+    line-height:1.6; white-space:pre-wrap; word-break:break-all;
+    min-height:60px; color:var(--dim); margin-bottom:14px;
+  }
+  #verdict { font-size:15px; font-weight:600; margin-bottom:10px; display:none; }
+  #verdict.ok { color:var(--ok); display:block; }
+  #verdict.warn { color:var(--warn); display:block; }
+  #verdict.err { color:var(--err); display:block; }
+  .note {
+    font-size:12px; color:var(--dim); line-height:1.8;
+    border-left:2px solid var(--border); padding-left:10px;
   }
 </style>
 </head>
@@ -40,24 +48,48 @@
 <div class="sub">realme Neo8 / RMX8899</div>
 
 <button id="btn">检查是否生效</button>
+
+<div id="verdict"></div>
 <div id="output">点上面的按钮。</div>
+
+<div class="note">
+检查依据：驱动加载固件时自行计算的校验和，与模块内文件比对。<br>
+必须在重启后 5 分钟内执行，否则内核日志被覆盖会无法确认。<br>
+需要完整报告：<code>su -c 'sh /data/adb/modules/vib_wave_boost/verify.sh -v'</code>
+</div>
 
 <script>
 const MOD = '/data/adb/modules/vib_wave_boost';
 const out = document.getElementById('output');
+const verdict = document.getElementById('verdict');
 const btn = document.getElementById('btn');
 
 btn.onclick = () => {
   btn.disabled = true;
+  verdict.className = '';
+  verdict.textContent = '';
   out.textContent = '读取中…';
   setTimeout(() => {
+    let r = '';
     try {
-      out.textContent = ksu.exec('sh ' + MOD + '/verify.sh 2>&1') || '(无输出)';
+      r = (ksu.exec('sh ' + MOD + '/verify.sh 2>&1') || '').trim();
     } catch (e) {
-      out.textContent = '执行失败：' + e;
-    } finally {
-      btn.disabled = false;
+      r = 'EXEC_ERROR ' + e;
     }
+    out.textContent = r || '(无输出)';
+
+    // 解析单行结论
+    if (r.indexOf('OK') === 0) {
+      verdict.textContent = '已生效';
+      verdict.className = 'ok';
+    } else if (r.indexOf('WAIT') === 0) {
+      verdict.textContent = '无法确认 — 请重启后立即重试';
+      verdict.className = 'warn';
+    } else if (r.indexOf('FAIL') === 0) {
+      verdict.textContent = '异常，见下方详情';
+      verdict.className = 'err';
+    }
+    btn.disabled = false;
   }, 50);
 };
 </script>
